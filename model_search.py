@@ -91,14 +91,16 @@ class Cell(nn.Module):
 
 class Network(nn.Module):
 
-  def __init__(self, C, num_classes, layers, criterion, steps=4, multiplier=4, stem_multiplier=3):
+  def __init__(self, C, num_classes, layers, criterion, regularizer, steps=4, multiplier=4, stem_multiplier=3, lambda_jr=0):
     super(Network, self).__init__()
     self._C = C
     self._num_classes = num_classes
     self._layers = layers
     self._criterion = criterion
+    self._regularizer = regularizer
     self._steps = steps
     self._multiplier = multiplier
+    self._lambda_jr = lambda_jr
 
     C_curr = stem_multiplier*C
     self.stem = nn.Sequential(
@@ -163,7 +165,10 @@ class Network(nn.Module):
 
   def _loss(self, input, target):
     logits = self(input)
-    return self._criterion(logits, target) 
+    loss = self._criterion(logits, target) 
+    if self._lambda_jr > 0:
+      loss += self._lambda_jr*self._regularizer(input, logits)
+    return loss
 
   def _initialize_alphas(self):
     k = sum(1 for i in range(self._steps) for n in range(2+i))

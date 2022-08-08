@@ -12,11 +12,14 @@ import torch.utils
 import torch.nn.functional as F
 import torchvision.datasets as dset
 import torch.backends.cudnn as cudnn
+import json 
 
 from torch.autograd import Variable
 from model_search import Network
 from architect import Architect
 from jacobian import JacobianReg
+
+from pgd import LinfPGDAttack
 
 parser = argparse.ArgumentParser("cifar")
 parser.add_argument('--data', type=str, default='../data', help='location of the data corpus')
@@ -42,8 +45,9 @@ parser.add_argument('--train_portion', type=float, default=0.5, help='portion of
 parser.add_argument('--unrolled', action='store_true', default=False, help='use one-step unrolled validation loss')
 parser.add_argument('--arch_learning_rate', type=float, default=3e-4, help='learning rate for arch encoding')
 parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
-parser.add_argument('--lambda_jr', type=float, default=1e-2, help='Lambda for Jacobian regularizer')
 parser.add_argument('--cell_steps', type=int, default=3, help='Number of intermediate nodes in a cell')
+parser.add_argument('--lambda_jr', type=float, default=1e-2, help='Lambda for Jacobian regularizer')
+parser.add_argument('--adv_epsilon', type=float, default=0., help='Epsilon for PGD adversarial')
 
 args = parser.parse_args()
 
@@ -56,7 +60,6 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
 fh = logging.FileHandler(os.path.join(args.save, 'log.txt'))
 fh.setFormatter(logging.Formatter(log_format))
 logging.getLogger().addHandler(fh)
-
 
 CIFAR_CLASSES = 10
 if args.set=='cifar100':
@@ -80,9 +83,15 @@ def main():
   reg_jacob = JacobianReg() # Jacobian regularization
   reg_jacob = reg_jacob.cuda()
 
-  model = Network(args.init_channels, CIFAR_CLASSES, args.layers, criterion, steps=args.cell_steps, multiplier=args.cell_steps)
+  model = Network(args.init_channels, CIFAR_CLASSES, args.layers, criterion, regularizer=reg_jacob, steps=args.cell_steps, multiplier=args.cell_steps, lambda_jr=args.lambda_jr)
   model = model.cuda()
-  logging.info("param size = %fMB", utils.count_parameters_in_MB(model))
+  model_size = utils.count_parameters_in_MB(model)
+  logging.info("param size = {}MB".format(model_size))
+
+  if args.adv_epsilon > 0:
+    adversarial = LinfPGDAttack(model, epsilon=args.adv_epsilon/255., alpha=args.adv_epsilon/4./255., no_iter=10)
+  else:
+    adversarial = None 
 
   optimizer = torch.optim.SGD(
       model.parameters(),
@@ -115,6 +124,7 @@ def main():
 
   architect = Architect(model, args)
 
+  start = time.time()
   for epoch in range(args.epochs):
     scheduler.step()
     lr = scheduler.get_lr()[0]
@@ -127,18 +137,27 @@ def main():
     #print(F.softmax(model.alphas_reduce, dim=-1))
 
     # training
-    train_acc, train_obj = train(train_queue, valid_queue, model, architect, criterion, reg_jacob, optimizer, lr,epoch)
+    train_acc, train_obj = train(train_queue, valid_queue, model, architect, criterion, optimizer, adversarial, lr, epoch)
     logging.info('train_acc %f', train_acc)
 
     # validation
     if args.epochs-epoch<=1:
-      valid_acc, valid_obj = infer(valid_queue, model, criterion, reg_jacob)
+      valid_acc, valid_obj = infer(valid_queue, model, criterion)
       logging.info('valid_acc %f', valid_acc)
 
     utils.save(model, os.path.join(args.save, 'weights.pt'))
+  elapsed = time.time() - start
+  logging.info("Elapsed: {:.3} hours".format(elapsed/60/60))
 
+  from genotypes import Genotype
+  genotype = model.genotype()
+  genotype = Genotype(
+    normal=genotype.normal, normal_concat=list(genotype.normal_concat),
+    reduce=genotype.reduce, reduce_concat=list(genotype.reduce_concat)
+  )
+  json.dump(genotype._asdict(), open(args.save+"/genotype.json", "w"))
 
-def train(train_queue, valid_queue, model, architect, criterion, reg_jacob, optimizer, lr, epoch):
+def train(train_queue, valid_queue, model, architect, criterion, optimizer, adversarial, lr, epoch):
   objs = utils.AvgrageMeter()
   top1 = utils.AvgrageMeter()
   top5 = utils.AvgrageMeter()
@@ -153,20 +172,19 @@ def train(train_queue, valid_queue, model, architect, criterion, reg_jacob, opti
 
     # get a random minibatch from the search queue with replacement
     input_search, target_search = next(iter(valid_queue))
-    #try:
-    #  input_search, target_search = next(valid_queue_iter)
-    #except:
-    #  valid_queue_iter = iter(valid_queue)
-    #  input_search, target_search = next(valid_queue_iter)
+
     input_search = Variable(input_search, requires_grad=False).cuda()
     target_search = Variable(target_search, requires_grad=False).cuda()
 
     if epoch>=15:
+      if adversarial is not None:
+        input_search = adversarial.perturb(input_search, target_search)
+
       architect.step(input, target, input_search, target_search, lr, optimizer, unrolled=args.unrolled)
 
     optimizer.zero_grad()
     logits = model(input)
-    loss = criterion(logits, target) + args.lambda_jr*reg_jacob(input, logits)
+    loss = criterion(logits, target)
 
     loss.backward()
     nn.utils.clip_grad_norm(model.parameters(), args.grad_clip)
@@ -182,32 +200,31 @@ def train(train_queue, valid_queue, model, architect, criterion, reg_jacob, opti
 
   return top1.avg, objs.avg
 
-
-def infer(valid_queue, model, criterion, reg_jacob):
+def infer(valid_queue, model, criterion):
   objs = utils.AvgrageMeter()
   top1 = utils.AvgrageMeter()
   top5 = utils.AvgrageMeter()
   model.eval()
 
-  for step, (input, target) in enumerate(valid_queue):
-    #input = input.cuda()
-    #target = target.cuda(non_blocking=True)
-    input = Variable(input, volatile=True).cuda()
-    input.requires_grad = True
+  with torch.no_grad():
+    for step, (input, target) in enumerate(valid_queue):
+      #input = input.cuda()
+      #target = target.cuda(non_blocking=True)
+      input = Variable(input).cuda()
+      input.requires_grad = True
 
-    target = Variable(target, volatile=True).cuda()
-    logits = model(input)
-    loss = criterion(logits, target)
-    reg_jacob(input, logits)
+      target = Variable(target).cuda()
+      logits = model(input)
+      loss = criterion(logits, target)
 
-    prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
-    n = input.size(0)
-    objs.update(loss.item(), n)
-    top1.update(prec1.item(), n)
-    top5.update(prec5.item(), n)
+      prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
+      n = input.size(0)
+      objs.update(loss.item(), n)
+      top1.update(prec1.item(), n)
+      top5.update(prec5.item(), n)
 
-    if step % args.report_freq == 0:
-      logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
+      if step % args.report_freq == 0:
+        logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
 
   return top1.avg, objs.avg
 
